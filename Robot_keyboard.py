@@ -15,13 +15,10 @@ class KeyboardVelocityPublisher(Node):
         # Publishers for velocity commands
         self.linear_pub = self.create_publisher(Float32, '/velocity', 10)
         self.angular_pub = self.create_publisher(Float32, '/angular_velocity', 10)
-        self.angular2_pub = self.create_publisher(Float32, '/angular2_velocity', 10)
-        
         
         # Velocity parameters
         self.linear_level = 0
         self.angular_level = 0
-        self.angular2_level = 0
         self.step = 51  # Velocity step per level
         self.prev_key = ''
         
@@ -53,20 +50,13 @@ class KeyboardVelocityPublisher(Node):
     
     def calculate_and_publish_velocity(self, key):
         # Reset angular level if switching from linear movement
-        if key in ['a', 'd'] and self.prev_key in ['w', 's', 'q', 'e']:
+        if key in ['a', 'd'] and self.prev_key in ['w', 's']:
             self.angular_level = 0
-            self.angular2_level = 0
-            
+        
         # Reset linear level if switching from angular movement
-        if key in ['w', 's'] and self.prev_key in ['a', 'd', 'q', 'e']:
+        if key in ['w', 's'] and self.prev_key in ['a', 'd']:
             self.linear_level = 0
-            self.angular2_level = 0
-            
-         # Reset linear level if switching from angular movement
-        if key in ['q', 'e'] and self.prev_key in ['a', 'd', 'w', 's']:
-            self.linear_level = 0  
-            self.angular_level = 0      
-            
+        
         # Handle key presses
         if key == 'w':
             self.linear_level = min(5, self.linear_level + 1)
@@ -127,7 +117,6 @@ def main():
         zero_vel.data = 0.0
         node.linear_pub.publish(zero_vel)
         node.angular_pub.publish(zero_vel)
-        node.angular2_pub.publish(zero_vel)
         
         node.destroy_node()
         rclpy.shutdown()
