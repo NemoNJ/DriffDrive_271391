@@ -1,0 +1,460 @@
+#include <Arduino.h>
+#include <micro_ros_platformio.h>
+#include <stdio.h>
+#include <vector>
+#include <cmath>
+#include <utility>
+#include <atomic>
+
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+
+#include <std_msgs/msg/bool.h>
+#include <std_msgs/msg/string.h>
+#include <geometry_msgs/msg/twist.h>
+#include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/int32.h>
+#include <std_msgs/msg/float32_multi_array.h>
+
+#include <config.h>
+#include <motor.h>
+#include <PIDF.h>
+
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if ((temp_rc != RCL_RET_OK)) { rclErrorLoop(); } }
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if ((temp_rc != RCL_RET_OK)) { } }
+#define EXECUTE_EVERY_N_MS(MS, X) do { static volatile int64_t init = -1; if (init == -1) { init = uxr_millis(); } if (uxr_millis() - init > MS) { X; init = uxr_millis(); } } while (0)
+
+// ##############################################
+// Hardware Configuration
+// Motor Pins
+#define MOTOR_L_IN1_1 18  // Front left wheel
+#define MOTOR_L_IN2_1 19
+#define MOTOR_L_IN1_2 22  // Rear left wheel
+#define MOTOR_L_IN2_2 23
+#define MOTOR_R_IN1_1 32  // Front right wheel
+#define MOTOR_R_IN2_1 33
+#define MOTOR_R_IN1_2 26  // Rear right wheel
+#define MOTOR_R_IN2_2 27
+
+// Encoder Pins
+#define ENCODER_L_A 34    // Left encoder channel A
+#define ENCODER_L_B 35    // Left encoder channel B
+#define ENCODER_R_A 36    // Right encoder channel A
+#define ENCODER_R_B 39    // Right encoder channel B
+
+// Encoder parameters
+#define ENCODER_PPR 1200  // Pulses per revolution
+// WHEEL_DIAMETER should be defined in config.h or esp32_hardware.h
+
+// PID parameters
+#define PID_KP 1.0
+#define PID_KI 0.1
+#define PID_KD 0.01
+#define PID_SAMPLE_TIME 10 // ms
+
+// ##############################################
+// Global Variables
+rcl_publisher_t status_publisher;
+rcl_publisher_t rpm_publisher;
+rcl_subscription_t velocity_subscriber;
+rcl_subscription_t angular_velocity_subscriber;
+
+std_msgs__msg__Int32 status_msg;
+std_msgs__msg__Float32 velocity_msg;
+std_msgs__msg__Float32 angular_velocity_msg;
+std_msgs__msg__Float32MultiArray rpm_msg;
+float rpm_data[2]; // Array to hold RPM values
+
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+rcl_timer_t control_timer;
+rcl_init_options_t init_options;
+
+unsigned long long time_offset = 0;
+unsigned long prev_cmd_time = 0;
+unsigned long prev_odom_update = 0;
+unsigned long current_time = 0;
+static unsigned long last_pub = 0;
+static int disconnect_count = 0;
+
+// Encoder variables
+std::atomic<long> encoderLeftCount(0);
+std::atomic<long> encoderRightCount(0);
+float rpmLeft = 0;
+float rpmRight = 0;
+unsigned long lastEncoderTime = 0;
+
+// PID controllers
+PIDF pidLeft(PID_KP, PID_KI, PID_KD, 0, 0, 0, 0, 0, 0); // Initialize with all parameters
+PIDF pidRight(PID_KP, PID_KI, PID_KD, 0, 0, 0, 0, 0, 0);
+
+// Target speeds
+float targetLeftSpeed = 0;
+float targetRightSpeed = 0;
+
+enum states {
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+} state;
+
+// ##############################################
+// Function Prototypes
+void rclErrorLoop();
+void syncTime();
+bool createEntities();
+bool destroyEntities();
+void flashLED(unsigned int);
+struct timespec getTime();
+void publishData();
+void set_motor_speed(int, int, float);
+void readEncoders();
+void calculateRPM();
+void updatePID();
+void IRAM_ATTR encoderLeftISR();
+void IRAM_ATTR encoderRightISR();
+
+// ##############################################
+// Setup and Main Loop
+void setup() {
+    Serial.begin(115200);
+    set_microros_serial_transports(Serial);
+    
+    // Initialize motor pins
+    pinMode(MOTOR_L_IN1_1, OUTPUT);
+    pinMode(MOTOR_L_IN2_1, OUTPUT);
+    pinMode(MOTOR_L_IN1_2, OUTPUT);
+    pinMode(MOTOR_L_IN2_2, OUTPUT);
+    pinMode(MOTOR_R_IN1_1, OUTPUT);
+    pinMode(MOTOR_R_IN2_1, OUTPUT);
+    pinMode(MOTOR_R_IN1_2, OUTPUT);
+    pinMode(MOTOR_R_IN2_2, OUTPUT);
+    
+    // Initialize encoder pins
+    pinMode(ENCODER_L_A, INPUT_PULLUP);
+    pinMode(ENCODER_L_B, INPUT_PULLUP);
+    pinMode(ENCODER_R_A, INPUT_PULLUP);
+    pinMode(ENCODER_R_B, INPUT_PULLUP);
+    
+    // Attach interrupts for encoders
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L_A), encoderLeftISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R_A), encoderRightISR, CHANGE);
+    
+    // Initialize PID controllers
+    // pidLeft.setOutputLimits(-255, 255);  // เปลี่ยนจาก SetOutputLimits เป็น setOutputLimits
+    // pidRight.setOutputLimits(-255, 255);
+    // pidLeft.SetMode(AUTOMATIC);
+    // pidRight.SetMode(AUTOMATIC);
+    // pidLeft.SetSampleTime(PID_SAMPLE_TIME);
+    // pidRight.SetSampleTime(PID_SAMPLE_TIME);
+}
+
+void loop() {
+    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+    
+    switch (state) {
+        case WAITING_AGENT:
+            EXECUTE_EVERY_N_MS(1000, state = (RMW_RET_OK == rmw_uros_ping_agent(500, 5)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+            break;
+        case AGENT_AVAILABLE:
+            state = (true == createEntities()) ? AGENT_CONNECTED : WAITING_AGENT;
+            if (state == WAITING_AGENT) {
+                destroyEntities();
+            }
+            break;
+        case AGENT_CONNECTED:
+            EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(500, 5)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+            if (state == AGENT_CONNECTED) {
+                rclc_executor_spin_some(&executor, RCL_MS_TO_NS(300));
+                // Read encoders and update RPM
+                readEncoders();
+                // Update PID controllers
+                updatePID();
+            }
+            break;
+        case AGENT_DISCONNECTED:
+            destroyEntities();
+            disconnect_count = 0;
+            state = WAITING_AGENT;
+            break;
+        default:
+            break;
+    }
+}
+
+// ##############################################
+// Encoder and PID Functions
+void IRAM_ATTR encoderLeftISR() {
+    if (digitalRead(ENCODER_L_B)) {
+        encoderLeftCount++;
+    } else {
+        encoderLeftCount--;
+    }
+}
+
+void IRAM_ATTR encoderRightISR() {
+    if (digitalRead(ENCODER_R_B)) {
+        encoderRightCount++;
+    } else {
+        encoderRightCount--;
+    }
+}
+
+void readEncoders() {
+    static unsigned long lastTime = 0;
+    static long lastLeftCount = 0;
+    static long lastRightCount = 0;
+    
+    unsigned long currentTime = millis();
+    unsigned long deltaTime = currentTime - lastTime;
+    
+    if (deltaTime >= 100) { // Update every 100ms
+        // Get atomic encoder counts
+        long currentLeftCount = encoderLeftCount.load();
+        long currentRightCount = encoderRightCount.load();
+        
+        long deltaLeft = currentLeftCount - lastLeftCount;
+        long deltaRight = currentRightCount - lastRightCount;
+        
+        // RPM = (counts per interval * 60000) / (PPR * interval in ms)
+        rpmLeft = (deltaLeft * 60000.0) / (ENCODER_PPR * deltaTime);
+        rpmRight = (deltaRight * 60000.0) / (ENCODER_PPR * deltaTime);
+        
+        // Update for next iteration
+        lastLeftCount = currentLeftCount;
+        lastRightCount = currentRightCount;
+        lastTime = currentTime;
+    }
+}
+
+void updatePID() {
+    // Calculate target RPM from target speeds (convert m/s to RPM)
+    // RPM = (speed * 60) / (pi * wheel diameter)
+    float targetLeftRPM = (targetLeftSpeed * 60) / (PI * WHEEL_DIAMETER);
+    float targetRightRPM = (targetRightSpeed * 60) / (PI * WHEEL_DIAMETER);
+    
+    // Update PID controllers
+    float leftOutput = pidLeft.compute(targetLeftRPM, rpmLeft);
+    float rightOutput = pidRight.compute(targetRightRPM, rpmRight);
+    
+    // จำกัดค่าสัญญาณด้วยตนเอง
+    leftOutput = constrain(leftOutput, -255, 255);
+    rightOutput = constrain(rightOutput, -255, 255);
+    
+    // Apply PID output to motors
+    set_motor_speed(MOTOR_L_IN1_1, MOTOR_L_IN2_1, (-1) * leftOutput);
+    set_motor_speed(MOTOR_L_IN1_2, MOTOR_L_IN2_2, (-1) * leftOutput);
+    set_motor_speed(MOTOR_R_IN1_1, MOTOR_R_IN2_1, rightOutput);
+    set_motor_speed(MOTOR_R_IN1_2, MOTOR_R_IN2_2, rightOutput);
+}
+
+// ##############################################
+// ROS Callbacks
+void velocity_callback(const void * msgin) {
+    velocity_msg.data = ((const std_msgs__msg__Float32*)msgin)->data;
+    prev_cmd_time = millis();
+    
+    // Update target speeds for PID control
+    targetLeftSpeed = velocity_msg.data;
+    targetRightSpeed = velocity_msg.data;
+}
+
+void angular_velocity_callback(const void * msgin) {
+    float angular_speed = ((const std_msgs__msg__Float32*)msgin)->data;
+    prev_cmd_time = millis();
+    
+    // Update target speeds with angular velocity adjustment
+    targetLeftSpeed = velocity_msg.data - angular_speed;
+    targetRightSpeed = velocity_msg.data + angular_speed;
+}
+
+void timer_callback(rcl_timer_t *, int64_t) {
+    // Empty for now
+}
+
+void controlCallback(rcl_timer_t *timer, int64_t last_call_time) {
+    RCLC_UNUSED(last_call_time);
+    if (timer != NULL) {
+        publishData();
+        
+        // Safety check - stop motors if no command received for 1 second
+        if (millis() - prev_cmd_time > 1000) {
+            targetLeftSpeed = 0;
+            targetRightSpeed = 0;
+        }
+    }
+}
+
+// ##############################################
+// ROS Entity Management
+bool createEntities() {
+    allocator = rcl_get_default_allocator();
+    
+    init_options = rcl_get_zero_initialized_init_options();
+    RCCHECK(rcl_init_options_init(&init_options, allocator));
+    RCCHECK(rcl_init_options_set_domain_id(&init_options, 10));
+    
+    RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
+    
+    // create node
+    RCCHECK(rclc_node_init_default(&node, "esp32_robot", "", &support));
+    
+    // Publishers
+    RCCHECK(rclc_publisher_init_best_effort(
+        &status_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+        "/motor_status"));
+
+    RCCHECK(rclc_publisher_init_best_effort(
+        &rpm_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+        "/wheel_rpm"));
+
+    // Subscribers
+    RCCHECK(rclc_subscription_init_default(
+        &velocity_subscriber,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "/cmd_vel/linear"));
+
+    RCCHECK(rclc_subscription_init_default(
+        &angular_velocity_subscriber,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "/cmd_vel/angular"));
+
+    // create timer for actuating the motors at 50 Hz (1000/20)
+    const unsigned int control_timeout = 20; // 50Hz
+    RCCHECK(rclc_timer_init_default2(
+        &control_timer,
+        &support,
+        RCL_MS_TO_NS(control_timeout),
+        controlCallback,
+        false));
+
+    executor = rclc_executor_get_zero_initialized_executor();
+    RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
+    RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
+    
+    RCCHECK(rclc_executor_add_subscription(
+        &executor,
+        &velocity_subscriber,
+        &velocity_msg,
+        &velocity_callback,
+        ON_NEW_DATA));
+    RCCHECK(rclc_executor_add_subscription(
+        &executor,
+        &angular_velocity_subscriber,
+        &angular_velocity_msg,
+        &angular_velocity_callback,
+        ON_NEW_DATA));
+    
+    syncTime();
+    
+    return true;
+}
+
+bool destroyEntities() {
+    rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
+    (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+    RCCHECK(rcl_publisher_fini(&status_publisher, &node));
+    RCCHECK(rcl_publisher_fini(&rpm_publisher, &node));
+    RCCHECK(rcl_subscription_fini(&velocity_subscriber, &node));
+    RCCHECK(rcl_subscription_fini(&angular_velocity_subscriber, &node));
+    RCCHECK(rcl_node_fini(&node));
+    RCCHECK(rcl_timer_fini(&control_timer));
+    RCCHECK(rclc_executor_fini(&executor));
+    RCCHECK(rclc_support_fini(&support));
+    
+    return true;
+}
+
+void publishData() {
+    // Publish status
+    status_msg.data = (fabs(targetLeftSpeed) > 0.1 || fabs(targetRightSpeed) > 0.1) ? 1 : 0;
+    RCSOFTCHECK(rcl_publish(&status_publisher, &status_msg, NULL));
+    
+    // Publish RPM data
+    rpm_msg.data.data = rpm_data;
+    rpm_msg.data.size = 2;
+    rpm_msg.data.capacity = 2;
+    rpm_data[0] = rpmLeft;
+    rpm_data[1] = rpmRight;
+    RCSOFTCHECK(rcl_publish(&rpm_publisher, &rpm_msg, NULL));
+}
+
+// ##############################################
+// Utility Functions
+void set_motor_speed(int in1_pin, int in2_pin, float speed) {
+    // Add deadband to prevent motor buzzing
+    if (fabs(speed) < 10) {
+        speed = 0;
+    }
+    
+    // Constrain speed to -255 to 255
+    speed = constrain(speed, -255, 255);
+    
+    if (speed > 0.0) {         // Forward
+        analogWrite(in1_pin, (int)speed);
+        analogWrite(in2_pin, 0);
+    } else if (speed < 0.0) {  // Backward
+        analogWrite(in1_pin, 0);
+        analogWrite(in2_pin, (int)(-speed));
+    } else {                   // Stop
+        analogWrite(in1_pin, 0);
+        analogWrite(in2_pin, 0);
+    }
+}
+
+void syncTime() {
+    // get the current time from the agent
+    unsigned long now = millis();
+    RCCHECK(rmw_uros_sync_session(10));
+    unsigned long long ros_time_ms = rmw_uros_epoch_millis();
+    // now we can find the difference between ROS time and uC time
+    time_offset = ros_time_ms - now;
+}
+
+struct timespec getTime() {
+    struct timespec tp = {0};
+    // add time difference between uC time and ROS time to
+    // synchronize time with ROS
+    unsigned long long now = millis() + time_offset;
+    tp.tv_sec = now / 1000;
+    tp.tv_nsec = (now % 1000) * 1000000;
+    return tp;
+}
+
+void rclErrorLoop() {
+    while (true) {
+        // Stop all motors in case of error
+        analogWrite(MOTOR_L_IN1_1, 0);
+        analogWrite(MOTOR_L_IN2_1, 0);
+        analogWrite(MOTOR_L_IN1_2, 0);
+        analogWrite(MOTOR_L_IN2_2, 0);
+        analogWrite(MOTOR_R_IN1_1, 0);
+        analogWrite(MOTOR_R_IN2_1, 0);
+        analogWrite(MOTOR_R_IN1_2, 0);
+        analogWrite(MOTOR_R_IN2_2, 0);
+        
+        flashLED(3);
+    }
+}
+
+void flashLED(unsigned int n_times) {
+    for (int i = 0; i < n_times; i++) {
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(100);
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(100);
+    }
+    delay(1000);
+}
