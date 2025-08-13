@@ -404,11 +404,11 @@ void set_motor_speed(int in1_pin, int in2_pin, float speed) {
     speed = constrain(speed, -255, 255);
     
     if (speed > 0.0) {         // Forward
-        analogWrite(in1_pin, (int)speed);
+        analogWrite(in1_pin, abs(speed));
         analogWrite(in2_pin, 0);
     } else if (speed < 0.0) {  // Backward
         analogWrite(in1_pin, 0);
-        analogWrite(in2_pin, (int)(-speed));
+        analogWrite(in2_pin, abs(speed));
     } else {                   // Stop
         analogWrite(in1_pin, 0);
         analogWrite(in2_pin, 0);
