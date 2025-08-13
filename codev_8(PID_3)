@@ -29,14 +29,16 @@
 // ##############################################
 // Hardware Configuration
 // Motor Pins
-#define MOTOR_L_IN1_1 18  // Front left wheel
-#define MOTOR_L_IN2_1 19
-#define MOTOR_L_IN1_2 22  // Rear left wheel
-#define MOTOR_L_IN2_2 23
-#define MOTOR_R_IN1_1 32  // Front right wheel
-#define MOTOR_R_IN2_1 33
-#define MOTOR_R_IN1_2 26  // Rear right wheel
-#define MOTOR_R_IN2_2 27
+#define MOTOR_R_IN1_1 18  // ล้อขวาหน้า
+#define MOTOR_R_IN2_1 19
+#define MOTOR_R_IN1_2 22  // ล้อขวาหลัง
+#define MOTOR_R_IN2_2 23
+
+#define MOTOR_L_IN1_1 32  // ล้อซ้ายหน้า
+#define MOTOR_L_IN2_1 33
+#define MOTOR_L_IN1_2 26  // ล้อซ้ายหลัง
+#define MOTOR_L_IN2_2 27
+
 
 // Encoder Pins
 #define ENCODER_L_A 34    // Left encoder channel A
