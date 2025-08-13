@@ -1,0 +1,416 @@
+#include <Arduino.h>
+#include <micro_ros_platformio.h>
+#include <stdio.h>
+
+#include <vector>
+#include <cmath>
+#include <utility>
+
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+
+#include <std_msgs/msg/bool.h>
+#include <std_msgs/msg/string.h>
+#include <geometry_msgs/msg/twist.h>
+#include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/int32.h>
+
+#include <PIDF.h>
+
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if ((temp_rc != RCL_RET_OK)) { rclErrorLoop(); } }
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if ((temp_rc != RCL_RET_OK)) { } }
+#define EXECUTE_EVERY_N_MS(MS, X) do { static volatile int64_t init = -1; if (init == -1) { init = uxr_millis(); } if (uxr_millis() - init > MS) { X; init = uxr_millis(); } } while (0)
+
+// Encoder Pins
+#define ENCODER_R1_A 34  // Left front encoder A phase
+#define ENCODER_R1_B 35  // Left front encoder B phase
+#define ENCODER_R2_A 36  // Left rear encoder A phase
+#define ENCODER_R2_B 39  // Left rear encoder B phase
+#define ENCODER_L1_A 4   // Right front encoder A phase
+#define ENCODER_L1_B 16  // Right front encoder B phase
+#define ENCODER_L2_A 17  // Right rear encoder A phase
+#define ENCODER_L2_B 5   // Right rear encoder B phase
+
+// Motor Pins
+#define MOTOR_R_IN1_1 18  // Right front
+#define MOTOR_R_IN2_1 19
+#define MOTOR_R_IN1_2 22  // Right rear
+#define MOTOR_R_IN2_2 23
+#define MOTOR_L_IN1_1 32  // Left front
+#define MOTOR_L_IN2_1 33
+#define MOTOR_L_IN1_2 26  // Left rear
+#define MOTOR_L_IN2_2 27
+
+// PID Parameters
+#define PID_UPDATE_RATE 50  // Hz
+#define WHEEL_RADIUS 0.1   // meters (adjust according to your wheel size)
+#define GEAR_RATIO 11       // From encoder datasheet
+#define PPR 11              // Pulses per revolution from datasheet
+#define RESOLUTION (PPR * GEAR_RATIO * 4)  // Quadrature encoding (4x)
+#define WHEELBASE 0.5       // Distance between left and right wheels in meters
+#define TRACK_WIDTH 0.3     // Distance between front and rear wheels in meters
+
+// Global variables
+volatile long encoderCounts[4] = {0};  // LF, LR, RF, RR
+float currentRPM[4] = {0};
+float targetRPM = 0;
+float targetAngularVelocity = 0;
+unsigned long lastEncoderUpdate = 0;
+
+// PID controllers for each wheel
+PIDF pidLF(0, 255, 1.0, 0.1, 0.01, -255, 255, 0.1, 0.5);
+PIDF pidLR(0, 255, 1.0, 0.1, 0.01, -255, 255, 0.1, 0.5);
+PIDF pidRF(0, 255, 1.0, 0.1, 0.01, -255, 255, 0.1, 0.5);
+PIDF pidRR(0, 255, 1.0, 0.1, 0.01, -255, 255, 0.1, 0.5);
+
+// ROS variables
+rcl_publisher_t status_publisher;
+rcl_publisher_t rpm_publisher;
+rcl_subscription_t velocity_subscriber;
+rcl_subscription_t angular_velocity_subscriber;
+
+std_msgs__msg__Int32 status_msg;
+std_msgs__msg__Float32 velocity_msg;
+std_msgs__msg__Float32 angular_velocity_msg;
+geometry_msgs__msg__Twist rpm_msg;
+
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+rcl_timer_t control_timer;
+rcl_init_options_t init_options;
+
+unsigned long long time_offset = 0;
+unsigned long prev_cmd_time = 0;
+unsigned long prev_odom_update = 0;
+unsigned long current_time = 0;
+static unsigned long last_pub = 0;
+static int disconnect_count = 0;
+
+enum states {
+    WAITING_AGENT,
+    AGENT_AVAILABLE,
+    AGENT_CONNECTED,
+    AGENT_DISCONNECTED
+} state;
+
+// Encoder interrupt handlers
+void IRAM_ATTR encoderLF_A() {
+    if (digitalRead(ENCODER_L1_A)) {
+        encoderCounts[0] += digitalRead(ENCODER_L1_B) ? -1 : 1;
+    } else {
+        encoderCounts[0] += digitalRead(ENCODER_L1_B) ? 1 : -1;
+    }
+}
+
+void IRAM_ATTR encoderLF_B() {
+    if (digitalRead(ENCODER_L1_B)) {
+        encoderCounts[0] += digitalRead(ENCODER_L1_A) ? 1 : -1;
+    } else {
+        encoderCounts[0] += digitalRead(ENCODER_L1_A) ? -1 : 1;
+    }
+}
+
+void IRAM_ATTR encoderLR_A() {
+    if (digitalRead(ENCODER_L2_A)) {
+        encoderCounts[1] += digitalRead(ENCODER_L2_B) ? -1 : 1;
+    } else {
+        encoderCounts[1] += digitalRead(ENCODER_L2_B) ? 1 : -1;
+    }
+}
+
+void IRAM_ATTR encoderLR_B() {
+    if (digitalRead(ENCODER_L2_B)) {
+        encoderCounts[1] += digitalRead(ENCODER_L2_A) ? 1 : -1;
+    } else {
+        encoderCounts[1] += digitalRead(ENCODER_L2_A) ? -1 : 1;
+    }
+}
+
+void IRAM_ATTR encoderRF_A() {
+    if (digitalRead(ENCODER_R1_A)) {
+        encoderCounts[2] += digitalRead(ENCODER_R1_B) ? -1 : 1;
+    } else {
+        encoderCounts[2] += digitalRead(ENCODER_R1_B) ? 1 : -1;
+    }
+}
+
+void IRAM_ATTR encoderRF_B() {
+    if (digitalRead(ENCODER_R1_B)) {
+        encoderCounts[2] += digitalRead(ENCODER_R1_A) ? 1 : -1;
+    } else {
+        encoderCounts[2] += digitalRead(ENCODER_R1_A) ? -1 : 1;
+    }
+}
+
+void IRAM_ATTR encoderRR_A() {
+    if (digitalRead(ENCODER_R2_A)) {
+        encoderCounts[3] += digitalRead(ENCODER_R2_B) ? -1 : 1;
+    } else {
+        encoderCounts[3] += digitalRead(ENCODER_R2_B) ? 1 : -1;
+    }
+}
+
+void IRAM_ATTR encoderRR_B() {
+    if (digitalRead(ENCODER_R2_B)) {
+        encoderCounts[3] += digitalRead(ENCODER_R2_A) ? 1 : -1;
+    } else {
+        encoderCounts[3] += digitalRead(ENCODER_R2_A) ? -1 : 1;
+    }
+}
+
+void setupEncoders() {
+    pinMode(ENCODER_L1_A, INPUT_PULLUP);
+    pinMode(ENCODER_L1_B, INPUT_PULLUP);
+    pinMode(ENCODER_L2_A, INPUT_PULLUP);
+    pinMode(ENCODER_L2_B, INPUT_PULLUP);
+    pinMode(ENCODER_R1_A, INPUT_PULLUP);
+    pinMode(ENCODER_R1_B, INPUT_PULLUP);
+    pinMode(ENCODER_R2_A, INPUT_PULLUP);
+    pinMode(ENCODER_R2_B, INPUT_PULLUP);
+    
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L1_A), encoderLF_A, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L1_B), encoderLF_B, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L2_A), encoderLR_A, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L2_B), encoderLR_B, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R1_A), encoderRF_A, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R1_B), encoderRF_B, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R2_A), encoderRR_A, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R2_B), encoderRR_B, CHANGE);
+}
+
+ void updateRPM() ;
+void set_motor_speed(int in1_pin, int in2_pin, float speed) {
+    speed = constrain(speed, -255, 255);
+    if (speed > 0.0) {
+        analogWrite(in1_pin, abs(speed));
+        analogWrite(in2_pin, 0);
+    } else if (speed < 0.0) {
+        analogWrite(in1_pin, 0);
+        analogWrite(in2_pin, abs(speed));
+    } else {
+        analogWrite(in1_pin, 0);
+        analogWrite(in2_pin, 0);
+    }
+}
+
+void velocity_callback(const void * msgin) {
+    float linear_velocity = ((const std_msgs__msg__Float32*)msgin)->data;
+    targetRPM = (linear_velocity * 60.0) / (2 * M_PI * WHEEL_RADIUS);
+}
+
+void angular_velocity_callback(const void * msgin) {
+    targetAngularVelocity = ((const std_msgs__msg__Float32*)msgin)->data;
+}
+
+void controlCallback(rcl_timer_t *timer, int64_t last_call_time) {
+    RCLC_UNUSED(last_call_time);
+    if (timer != NULL) {
+        updateRPM();
+        
+        float differential_RPM = (targetAngularVelocity * WHEELBASE * 60.0) / (2 * M_PI * WHEEL_RADIUS);
+        
+        float targetLF = targetRPM - differential_RPM;
+        float targetLR = targetRPM - differential_RPM;
+        float targetRF = targetRPM + differential_RPM;
+        float targetRR = targetRPM + differential_RPM;
+        
+        float outputLF = pidLF.compute(targetLF, currentRPM[0]);
+        float outputLR = pidLR.compute(targetLR, currentRPM[1]);
+        float outputRF = pidRF.compute(targetRF, currentRPM[2]);
+        float outputRR = pidRR.compute(targetRR, currentRPM[3]);
+        
+        set_motor_speed(MOTOR_L_IN1_1, MOTOR_L_IN2_1, -outputLF);
+        set_motor_speed(MOTOR_L_IN1_2, MOTOR_L_IN2_2, -outputLR);
+        set_motor_speed(MOTOR_R_IN1_1, MOTOR_R_IN2_1, outputRF);
+        set_motor_speed(MOTOR_R_IN1_2, MOTOR_R_IN2_2, outputRR);
+        
+        status_msg.data = (abs(targetRPM) > 0.1) ? 1 : 0;
+        RCSOFTCHECK(rcl_publish(&status_publisher, &status_msg, NULL));
+    }
+}
+
+
+void rclErrorLoop() {
+    while (true) {
+        delay(1000);
+    }
+}
+
+void syncTime() {
+    unsigned long now = millis();
+    RCCHECK(rmw_uros_sync_session(10));
+    unsigned long long ros_time_ms = rmw_uros_epoch_millis();
+    time_offset = ros_time_ms - now;
+}
+
+bool createEntities() {
+    allocator = rcl_get_default_allocator();
+    
+    init_options = rcl_get_zero_initialized_init_options();
+    rcl_init_options_init(&init_options, allocator);
+    rcl_init_options_set_domain_id(&init_options, 10);
+    
+    rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator);
+    
+    RCCHECK(rclc_node_init_default(&node, "esp32", "", &support));
+    
+    RCCHECK(rclc_publisher_init_best_effort(
+        &status_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+        "/motor_status"));
+
+    RCCHECK(rclc_subscription_init_default(
+        &velocity_subscriber,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "/velocity"));
+  
+    RCCHECK(rclc_subscription_init_default(
+        &angular_velocity_subscriber,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "/angular_velocity"));
+
+    RCCHECK(rclc_publisher_init_best_effort(
+        &rpm_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "/wheel_rpm"));
+
+    const unsigned int control_timeout = 20; // 50Hz
+    RCCHECK(rclc_timer_init_default2(
+    &control_timer,
+    &support,
+    RCL_MS_TO_NS(control_timeout),
+    controlCallback,
+    &allocator));
+
+    executor = rclc_executor_get_zero_initialized_executor();
+    RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
+    RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
+    RCCHECK(rclc_executor_add_subscription(
+        &executor,
+        &velocity_subscriber,
+        &velocity_msg,
+        &velocity_callback,
+        ON_NEW_DATA));
+    RCCHECK(rclc_executor_add_subscription(
+        &executor,
+        &angular_velocity_subscriber,
+        &angular_velocity_msg,
+        &angular_velocity_callback,
+        ON_NEW_DATA));
+    
+    syncTime();
+    return true;
+}
+
+bool destroyEntities() {
+    rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
+    (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+    rcl_publisher_fini(&status_publisher, &node);
+    rcl_subscription_fini(&velocity_subscriber, &node);
+    rcl_subscription_fini(&angular_velocity_subscriber, &node);
+    rcl_publisher_fini(&rpm_publisher, &node);
+    rcl_node_fini(&node);
+    rcl_timer_fini(&control_timer);
+    rclc_executor_fini(&executor);
+    rclc_support_fini(&support);
+    
+    return true;
+}
+
+void updateRPM() {
+    static unsigned long lastUpdate = 0;
+    unsigned long now = millis();
+    float dt = (now - lastUpdate) / 1000.0; // Convert to seconds
+    
+    if (dt > 0.05 && dt < 1.0) { // ตรวจสอบว่า dt อยู่ในช่วงสมเหตุสมผล
+        for (int i = 0; i < 4; i++) {
+            currentRPM[i] = (encoderCounts[i] / (float)RESOLUTION) * 60.0 / dt;
+            encoderCounts[i] = 0;
+        }
+        lastUpdate = now;
+
+        // Debug print
+        Serial.printf("RPM: LF=%.2f, LR=%.2f, RF=%.2f, RR=%.2f\n", 
+            currentRPM[0], currentRPM[1], currentRPM[2], currentRPM[3]);
+
+        rpm_msg.linear.x = currentRPM[0];
+        rpm_msg.linear.y = currentRPM[1];
+        rpm_msg.linear.z = currentRPM[2];
+        rpm_msg.angular.x = currentRPM[3];
+        RCSOFTCHECK(rcl_publish(&rpm_publisher, &rpm_msg, NULL));
+    }
+}
+// void updateRPM() {
+//     static unsigned long lastUpdate = 0;
+//     unsigned long now = millis();
+//     float dt = (now - lastUpdate) / 1000.0; // Convert to seconds
+    
+//     if (dt > 0.05) { // Update at ~20Hz
+//         for (int i = 0; i < 4; i++) {
+//             currentRPM[i] = (encoderCounts[i] / (float)RESOLUTION) * 60.0 / dt;
+//             encoderCounts[i] = 0;
+//         }
+//         lastUpdate = now;
+
+//         // Publish RPM values as Twist message
+//         rpm_msg.linear.x = currentRPM[0];  // Left front
+//         rpm_msg.linear.y = currentRPM[1];  // Left rear
+//         rpm_msg.linear.z = currentRPM[2];  // Right front
+//         rpm_msg.angular.x = currentRPM[3]; // Right rear
+//         rpm_msg.angular.y = 0;             // Not used
+//         rpm_msg.angular.z = 0;             // Not used
+        
+//         RCSOFTCHECK(rcl_publish(&rpm_publisher, &rpm_msg, NULL));
+//     }
+// }
+void setup() {
+    Serial.begin(115200);
+    set_microros_serial_transports(Serial);
+    
+    pinMode(MOTOR_L_IN1_1, OUTPUT);
+    pinMode(MOTOR_L_IN2_1, OUTPUT);
+    pinMode(MOTOR_L_IN1_2, OUTPUT);
+    pinMode(MOTOR_L_IN2_2, OUTPUT);
+    pinMode(MOTOR_R_IN1_1, OUTPUT);
+    pinMode(MOTOR_R_IN2_1, OUTPUT);
+    pinMode(MOTOR_R_IN1_2, OUTPUT);
+    pinMode(MOTOR_R_IN2_2, OUTPUT);
+    
+    setupEncoders();
+}
+
+void loop() {
+    switch (state) {
+        case WAITING_AGENT:
+            EXECUTE_EVERY_N_MS(1000, state = (RMW_RET_OK == rmw_uros_ping_agent(500, 5)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+            break;
+        case AGENT_AVAILABLE:
+            state = (true == createEntities()) ? AGENT_CONNECTED : WAITING_AGENT;
+            if (state == WAITING_AGENT) {
+                destroyEntities();
+            }
+            break;
+        case AGENT_CONNECTED:
+            EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(500, 5)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+            if (state == AGENT_CONNECTED) {
+                rclc_executor_spin_some(&executor, RCL_MS_TO_NS(300));
+            }
+            break;
+        case AGENT_DISCONNECTED:
+            destroyEntities();
+            disconnect_count = 0;
+            state = WAITING_AGENT;
+            break;
+        default:
+            break;
+    }
+}
