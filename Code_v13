@@ -1,0 +1,261 @@
+#include <Arduino.h>
+#include <micro_ros_platformio.h>
+#include <stdio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <std_msgs/msg/int32.h>
+#include <std_msgs/msg/float32.h>
+// Add this include at the top with other includes
+#include <geometry_msgs/msg/twist.h>
+#include <rclc/publisher.h>
+#include <rclc/subscription.h>
+#include <rclc/timer.h>
+// Add this before the RCCHECK macro
+void rclErrorLoop();
+
+// RCCHECK macro
+#define RCCHECK(fn) { \
+  rcl_ret_t temp_rc = fn; \
+  if((temp_rc)!=RCL_RET_OK){ \
+    Serial.print("Error at "); Serial.print(#fn); Serial.print(": "); Serial.println(temp_rc); \
+    rclErrorLoop(); \
+  } \
+}
+
+// Motor Pins
+#define MOTOR_R_IN1_1 18  // Master
+#define MOTOR_R_IN2_1 19
+#define MOTOR_R_IN1_2 22  // Slave
+#define MOTOR_R_IN2_2 23
+#define MOTOR_L_IN1_1 32  // Slave
+#define MOTOR_L_IN2_1 33
+#define MOTOR_L_IN1_2 26  // Slave
+#define MOTOR_L_IN2_2 27
+
+// Encoder Pins
+#define ENCODER_R1_A 34
+#define ENCODER_R1_B 35
+#define ENCODER_R2_A 36
+#define ENCODER_R2_B 39
+#define ENCODER_L1_A 4
+#define ENCODER_L1_B 16
+#define ENCODER_L2_A 17
+#define ENCODER_L2_B 5
+
+// Encoder variables
+volatile int enc_count_r1=0, enc_count_r2=0, enc_count_l1=0, enc_count_l2=0;
+unsigned long last_time_r1=0,last_time_r2=0,last_time_l1=0,last_time_l2=0;
+float rpm_master=0;
+float rpm_slave[3]={0,0,0};
+float rpm_slave_filtered[3]={0,0,0};
+float alpha=0.3; // low-pass filter
+
+// PWM
+int pwm_master=0;
+int pwm_slave[3]={0,0,0};
+
+// PID struct
+struct PID{
+    float Kp,Ki,Kd;
+    float integral;
+    float prev_error;
+    float output_min,output_max;
+};
+PID pid_slave[3] = {
+    {0.5,0.05,0.01,0,0,-255,255},
+    {0.5,0.05,0.01,0,0,-255,255},
+    {0.5,0.05,0.01,0,0,-255,255}
+};
+
+// ROS variables
+rcl_publisher_t status_publisher;
+rcl_subscription_t velocity_subscriber;
+rcl_subscription_t angular_velocity_subscriber;
+std_msgs__msg__Int32 status_msg;
+std_msgs__msg__Float32 velocity_msg;
+std_msgs__msg__Float32 angular_velocity_msg;
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+rcl_timer_t control_timer;
+rcl_init_options_t init_options;
+// Add these to your ROS variables section
+rcl_publisher_t wheel_rpm_publisher;
+geometry_msgs__msg__Twist wheel_rpm_msg;
+// Agent state
+enum states {WAITING_AGENT,AGENT_AVAILABLE,AGENT_CONNECTED,AGENT_DISCONNECTED};
+states state = WAITING_AGENT;
+
+// Encoder interrupts
+void enc_r1_interrupt() { enc_count_r1 += (digitalRead(ENCODER_R1_B)==HIGH)?1:-1; }
+void enc_r2_interrupt() { enc_count_r2 += (digitalRead(ENCODER_R2_B)==HIGH)?1:-1; }
+void enc_l1_interrupt() { enc_count_l1 += (digitalRead(ENCODER_L1_B)==HIGH)?1:-1; }
+void enc_l2_interrupt() { enc_count_l2 += (digitalRead(ENCODER_L2_B)==HIGH)?1:-1; }
+
+// Calculate RPM
+void calculate_rpm(){
+    unsigned long t = millis();
+    rpm_master = (enc_count_r1 / ((t-last_time_r1)/1000.0)) * 60.0;
+    rpm_slave[0] = (enc_count_r2 / ((t-last_time_r2)/1000.0)) * 60.0;
+    rpm_slave[1] = (enc_count_l1 / ((t-last_time_l1)/1000.0)) * 60.0;
+    rpm_slave[2] = (enc_count_l2 / ((t-last_time_l2)/1000.0)) * 60.0;
+    enc_count_r1=enc_count_r2=enc_count_l1=enc_count_l2=0;
+    last_time_r1=last_time_r2=last_time_l1=last_time_l2=t;
+}
+
+// Motor control
+void set_motor_speed(int in1,int in2,int pwm){
+    pwm=constrain(pwm,-255,255);
+    if(pwm>0){ analogWrite(in1,pwm); analogWrite(in2,0);}
+    else if(pwm<0){ analogWrite(in1,0); analogWrite(in2,-pwm);}
+    else{ analogWrite(in1,0); analogWrite(in2,0);}
+}
+
+// ROS callbacks
+void velocity_callback(const void * msgin){
+    velocity_msg.data = ((const std_msgs__msg__Float32*)msgin)->data;
+    pwm_master = constrain((int)velocity_msg.data,-255,255);
+}
+
+void angular_velocity_callback(const void * msgin){
+    float ang = ((const std_msgs__msg__Float32*)msgin)->data;
+    pwm_master = constrain(pwm_master + (int)ang,-255,255);
+}
+
+// Publish motor status
+void publishData(){ 
+  status_msg.data = abs(pwm_master)>10?1:0;
+    RCCHECK(rcl_publish(&status_publisher, &status_msg, NULL));
+    
+    // New RPM publish using Twist message
+    // Using linear.x, linear.y, linear.z for right wheels
+    // and angular.x, angular.y, angular.z for left wheels
+    wheel_rpm_msg.linear.x = rpm_master;       // Right master
+    wheel_rpm_msg.linear.y = rpm_slave[0];     // Right slave 1
+    wheel_rpm_msg.linear.z = rpm_slave[1];     // Right slave 2
+    wheel_rpm_msg.angular.x = rpm_slave[2];    // Left slave 1
+    wheel_rpm_msg.angular.y = 0;               // Reserved
+    wheel_rpm_msg.angular.z = 0;               // Reserved
+    RCCHECK(rcl_publish(&wheel_rpm_publisher, &wheel_rpm_msg, NULL));
+}
+
+// Timer callback (Master-Slave PID)
+void controlCallback(rcl_timer_t *timer,int64_t last_call_time){
+    calculate_rpm();
+    // Low-pass filter
+    for(int i=0;i<3;i++){
+        rpm_slave_filtered[i] = alpha*rpm_slave_filtered[i] + (1-alpha)*rpm_slave[i];
+    }
+    // PID
+    for(int i=0;i<3;i++){
+        float error = rpm_master - rpm_slave_filtered[i];
+        pid_slave[i].integral += error * 0.025;
+        float derivative = (error - pid_slave[i].prev_error)/0.025;
+        float output = pid_slave[i].Kp*error + pid_slave[i].Ki*pid_slave[i].integral + pid_slave[i].Kd*derivative;
+        output = constrain(output,-255,255);
+        pwm_slave[i] = output;
+        pid_slave[i].prev_error = error;
+    }
+    // Apply PWM
+    set_motor_speed(MOTOR_R_IN1_1,MOTOR_R_IN2_1,pwm_master); // Master
+    set_motor_speed(MOTOR_R_IN1_2,MOTOR_R_IN2_2,pwm_slave[0]);
+    set_motor_speed(MOTOR_L_IN1_1,MOTOR_L_IN2_1,pwm_slave[1]);
+    set_motor_speed(MOTOR_L_IN1_2,MOTOR_L_IN2_2,pwm_slave[2]);
+    publishData();
+}
+
+// Error handling
+void flashLED(unsigned int n){ delay(1000);}
+void rclErrorLoop(){while(true) flashLED(3);}
+
+// Sync time
+void syncTime(){
+    unsigned long now = millis();
+    RCCHECK(rmw_uros_sync_session(10));
+}
+
+// Create ROS entities
+bool createEntities(){
+    allocator=rcl_get_default_allocator();
+    init_options = rcl_get_zero_initialized_init_options();
+    RCCHECK(rcl_init_options_init(&init_options,allocator));
+    RCCHECK(rcl_init_options_set_domain_id(&init_options,10));
+    RCCHECK(rclc_support_init_with_options(&support,0,NULL,&init_options,&allocator));
+    RCCHECK(rclc_node_init_default(&node, "esp32", "", &support));
+
+    RCCHECK(rclc_publisher_init_best_effort(&status_publisher,&node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs,msg,Int32),"/motor_status"));
+    RCCHECK(rclc_subscription_init_default(&velocity_subscriber,&node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs,msg,Float32),"/velocity"));
+    RCCHECK(rclc_subscription_init_default(&angular_velocity_subscriber,&node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs,msg,Float32),"/angular_velocity"));
+    RCCHECK(rclc_publisher_init_best_effort(&wheel_rpm_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),"/wheel_rpm"));
+    const unsigned int control_timeout = 25;
+    RCCHECK(rclc_timer_init_default2(&control_timer,&support,RCL_MS_TO_NS(control_timeout),controlCallback,true));
+
+    executor = rclc_executor_get_zero_initialized_executor();
+    RCCHECK(rclc_executor_init(&executor,&support.context,3,&allocator));
+    RCCHECK(rclc_executor_add_timer(&executor,&control_timer));
+    RCCHECK(rclc_executor_add_subscription(&executor,&velocity_subscriber,&velocity_msg,&velocity_callback,ON_NEW_DATA));
+    RCCHECK(rclc_executor_add_subscription(&executor,&angular_velocity_subscriber,&angular_velocity_msg,&angular_velocity_callback,ON_NEW_DATA));
+
+    syncTime();
+    return true;
+}
+
+// Destroy entities
+bool destroyEntities(){
+    RCCHECK(rcl_publisher_fini(&status_publisher,&node));
+    RCCHECK(rcl_subscription_fini(&velocity_subscriber,&node));
+    RCCHECK(rcl_subscription_fini(&angular_velocity_subscriber,&node));
+    RCCHECK(rcl_publisher_fini(&wheel_rpm_publisher, &node));
+    RCCHECK(rcl_node_fini(&node));
+    RCCHECK(rcl_timer_fini(&control_timer));
+    RCCHECK(rclc_executor_fini(&executor));
+    RCCHECK(rclc_support_fini(&support));
+    return true;
+}
+
+// Setup
+void setup(){
+    Serial.begin(115200);
+    set_microros_serial_transports(Serial);
+
+    pinMode(MOTOR_R_IN1_1,OUTPUT);
+    pinMode(MOTOR_R_IN2_1,OUTPUT);
+    pinMode(MOTOR_R_IN1_2,OUTPUT);
+    pinMode(MOTOR_R_IN2_2,OUTPUT);
+    pinMode(MOTOR_L_IN1_1,OUTPUT);
+    pinMode(MOTOR_L_IN2_1,OUTPUT);
+    pinMode(MOTOR_L_IN1_2,OUTPUT);
+    pinMode(MOTOR_L_IN2_2,OUTPUT);
+
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R1_A),enc_r1_interrupt,RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R2_A),enc_r2_interrupt,RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L1_A),enc_l1_interrupt,RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L2_A),enc_l2_interrupt,RISING);
+}
+
+// Loop
+void loop(){
+    switch(state){
+        case WAITING_AGENT:
+            state = (RMW_RET_OK==rmw_uros_ping_agent(500,5))?AGENT_AVAILABLE:WAITING_AGENT;
+            break;
+        case AGENT_AVAILABLE:
+            state = (true==createEntities())?AGENT_CONNECTED:WAITING_AGENT;
+            break;
+        case AGENT_CONNECTED:
+            rclc_executor_spin_some(&executor,RCL_MS_TO_NS(10));
+            break;
+        case AGENT_DISCONNECTED:
+            destroyEntities();
+            state = WAITING_AGENT;
+            break;
+        default: break;
+    }
+}
