@@ -394,10 +394,10 @@ void flashLED(unsigned int n_times)
 
 void set_motor_speed(int in1_pin, int in2_pin, float speed) {
        if (in1_pin == MOTOR_L_IN1_1 && in2_pin == MOTOR_L_IN2_1) {
-            speed = speed;
+            speed = speed*0.993;
        }
        else if (in1_pin == MOTOR_L_IN1_2 && in2_pin == MOTOR_L_IN2_2) {
-            speed = speed;
+            speed = speed*0.99;
        }
        else if (in1_pin == MOTOR_R_IN1_1 && in2_pin == MOTOR_R_IN2_1) {
             speed = speed*0.89;
